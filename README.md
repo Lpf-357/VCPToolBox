@@ -1,4 +1,3 @@
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/lioensky/VCPToolBox)
 [English](README_en.md) | [日本語](README_ja.md) | [Русский](README_ru.md)
 
 ---
