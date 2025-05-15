@@ -1,4 +1,5 @@
 [English](README_en.md) | [日本語](README_ja.md) | [Русский](README_ru.md)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Lpf-357/VCPToolBox)
 
 ---
 # VCP (Variable & Command Protocol) - AI 能力增强中间层工具箱
