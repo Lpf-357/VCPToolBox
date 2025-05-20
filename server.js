@@ -9,6 +9,7 @@ const { Writable } = require('stream');
 const crypto = require('crypto');
 const pluginManager = require('./Plugin.js');
 const basicAuth = require('basic-auth');
+const cors = require('cors'); // 引入 cors 模块
 
 dotenv.config({ path: 'config.env' });
 
@@ -72,6 +73,7 @@ if (superDetectors.length > 0) console.log(`共加载了 ${superDetectors.length
 else console.log('未加载任何全局上下文转换规则。');
 
 const app = express();
+app.use(cors()); // 启用 CORS，允许跨域请求
 const port = process.env.PORT;
 const apiKey = process.env.API_Key;
 const apiUrl = process.env.API_URL;
@@ -154,9 +156,27 @@ app.use((req, res, next) => {
 // This function is no longer needed as the EmojiListGenerator plugin handles generation.
 // async function updateAndLoadAgentEmojiList(agentName, dirPath, filePath) { ... }
 
-async function replaceCommonVariables(text) {
+async function replaceCommonVariables(text, model) {
     if (text == null) return '';
     let processedText = String(text);
+    const sarModels = (process.env.SarModel || '').split(',').map(m => m.trim()).filter(m => m.length > 0);
+    const isSarModel = model && sarModels.includes(model);
+
+    // Replace Sar variables if the model matches SarModel list
+    if (isSarModel) {
+        for (const envKey in process.env) {
+            if (envKey.startsWith('Sar') && envKey !== 'SarModel') { // Exclude SarModel itself
+                const placeholder = `{{${envKey}}}`;
+                const value = process.env[envKey];
+                processedText = processedText.replaceAll(placeholder, value || `未配置${envKey}`);
+            }
+        }
+    } else {
+        // If not a SarModel, remove any Sar placeholders
+        const sarPlaceholderRegex = /\{\{Sar.+?\}\}/g;
+        processedText = processedText.replaceAll(sarPlaceholderRegex, '');
+    }
+
     const now = new Date();
     const date = now.toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' });
     processedText = processedText.replace(/\{\{Date\}\}/g, date);
@@ -276,6 +296,42 @@ async function replaceCommonVariables(text) {
     return processedText;
 }
 
+app.get('/v1/models', async (req, res) => {
+    const { default: fetch } = await import('node-fetch');
+    try {
+        const modelsApiUrl = `${apiUrl}/v1/models`;
+        const apiResponse = await fetch(modelsApiUrl, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
+                'Accept': req.headers['accept'] || 'application/json',
+            },
+        });
+
+        // Forward the status code and headers from the upstream API
+        res.status(apiResponse.status);
+        apiResponse.headers.forEach((value, name) => {
+            // Avoid forwarding hop-by-hop headers
+            if (!['content-encoding', 'transfer-encoding', 'connection', 'content-length', 'keep-alive'].includes(name.toLowerCase())) {
+                 res.setHeader(name, value);
+            }
+        });
+
+        // Stream the response body back to the client
+        apiResponse.body.pipe(res);
+
+    } catch (error) {
+        console.error('转发 /v1/models 请求时出错:', error.message, error.stack);
+        if (!res.headersSent) {
+             res.status(500).json({ error: 'Internal Server Error', details: error.message });
+        } else if (!res.writableEnded) {
+             console.error('[STREAM ERROR] Headers already sent. Cannot send JSON error. Ending stream if not already ended.');
+             res.end();
+        }
+    }
+});
+
 app.post('/v1/chat/completions', async (req, res) => {
     const { default: fetch } = await import('node-fetch');
     try {
@@ -322,12 +378,12 @@ app.post('/v1/chat/completions', async (req, res) => {
             originalBody.messages = await Promise.all(originalBody.messages.map(async (msg) => {
                 const newMessage = JSON.parse(JSON.stringify(msg));
                 if (newMessage.content && typeof newMessage.content === 'string') {
-                    newMessage.content = await replaceCommonVariables(newMessage.content);
+                    newMessage.content = await replaceCommonVariables(newMessage.content, originalBody.model);
                 } else if (Array.isArray(newMessage.content)) {
                     newMessage.content = await Promise.all(newMessage.content.map(async (part) => {
                         if (part.type === 'text' && typeof part.text === 'string') {
                             const newPart = JSON.parse(JSON.stringify(part));
-                            newPart.text = await replaceCommonVariables(newPart.text);
+                            newPart.text = await replaceCommonVariables(newPart.text, originalBody.model);
                             return newPart;
                         }
                         return part;
@@ -529,6 +585,9 @@ app.post('/v1/chat/completions', async (req, res) => {
                 if (DEBUG_MODE) console.log('[VCP Stream Loop] Combined tool results for next AI call (first 200):', combinedToolResultsForAI.substring(0,200));
 
                 // --- Make next AI call (stream: true) ---
+                if (!res.writableEnded) {
+                    res.write('\n'); // 在下一个AI响应开始前，向客户端发送一个换行符
+                }
                 if (DEBUG_MODE) console.log('[VCP Stream Loop] Fetching next AI response.');
                 const nextAiAPIResponse = await fetch(`${apiUrl}/v1/chat/completions`, {
                     method: 'POST',
@@ -565,6 +624,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             // After loop (or if no tools called initially / max recursion hit)
             if (!res.writableEnded) {
                 if (DEBUG_MODE) console.log('[VCP Stream Loop] Loop finished. Sending final [DONE].');
+                res.write('\n'); // Add newline before DONE
                 res.write('data: [DONE]\n\n');
                 res.end();
             }
@@ -697,9 +757,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 
                     try {
                         const recursionJson = JSON.parse(recursionText);
-                        currentAIContentForLoop = recursionJson.choices?.[0]?.message?.content || '';
+                        currentAIContentForLoop = "\n" + (recursionJson.choices?.[0]?.message?.content || '');
                     } catch (e) {
-                        currentAIContentForLoop = recursionText;
+                        currentAIContentForLoop = "\n" + recursionText;
                     }
                 } else {
                     // No tool calls found in the currentAIContentForLoop, so this is the final AI response.
@@ -850,9 +910,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 
                     try {
                         const recursionJson = JSON.parse(recursionText);
-                        currentAIContentForLoop = recursionJson.choices?.[0]?.message?.content || '';
+                        currentAIContentForLoop = "\n" + (recursionJson.choices?.[0]?.message?.content || '');
                     } catch (e) {
-                        currentAIContentForLoop = recursionText;
+                        currentAIContentForLoop = "\n" + recursionText;
                     }
                     if (DEBUG_MODE) console.log('[VCP NonStream Loop] Next AI content (first 200):', currentAIContentForLoop.substring(0,200));
 
@@ -871,7 +931,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     if (item.type === 'ai') return item.content;
                     if (item.type === 'vcp' && SHOW_VCP_OUTPUT) return `\n<<<[VCP_RESULT]>>>\n${item.content}\n<<<[END_VCP_RESULT]>>>\n`;
                     return '';
-                }).join('');
+                }).join('') + '\n'; // Add newline at the end
 
             let finalJsonResponse_nonStream;
             try {
@@ -1002,724 +1062,16 @@ async function handleDiaryFromAIResponse(responseText) {
     }
 }
 
-// --- Admin API Router ---
-const adminApiRouter = express.Router();
+// --- Admin API Router (Moved to routes/adminPanelRoutes.js) ---
 
-// GET main config.env content (filtered)
-adminApiRouter.get('/config/main', async (req, res) => {
-    try {
-        const configPath = path.join(__dirname, 'config.env');
-        const content = await fs.readFile(configPath, 'utf-8');
-        res.json({ content: content });
-    } catch (error) {
-        console.error('Error reading main config for admin panel:', error);
-        res.status(500).json({ error: 'Failed to read main config file', details: error.message });
-    }
-});
-
-// GET raw main config.env content (for saving purposes)
-adminApiRouter.get('/config/main/raw', async (req, res) => {
-    try {
-        const configPath = path.join(__dirname, 'config.env');
-        const content = await fs.readFile(configPath, 'utf-8');
-        res.json({ content: content });
-    } catch (error) {
-        console.error('Error reading raw main config for admin panel:', error);
-        res.status(500).json({ error: 'Failed to read raw main config file', details: error.message });
-    }
-});
-
-// POST to save main config.env content
-adminApiRouter.post('/config/main', async (req, res) => {
-    const { content } = req.body;
-    if (typeof content !== 'string') {
-        return res.status(400).json({ error: 'Invalid content format. String expected.' });
-    }
-    try {
-        const configPath = path.join(__dirname, 'config.env');
-        await fs.writeFile(configPath, content, 'utf-8');
-        // Re-load dotenv to reflect changes in the current process (optional, might have side effects)
-        // dotenv.config({ path: 'config.env', override: true });
-        // console.log('[AdminPanel] Main config.env reloaded into process.env');
-        res.json({ message: '主配置已成功保存。更改可能需要重启服务才能完全生效。' });
-    } catch (error) {
-        console.error('Error writing main config for admin panel:', error);
-        res.status(500).json({ error: 'Failed to write main config file', details: error.message });
-    }
-});
-
-// GET plugin list with manifest, status, and config.env content
-adminApiRouter.get('/plugins', async (req, res) => {
-    const PLUGIN_DIR = path.join(__dirname, 'Plugin');
-    const manifestFileName = 'plugin-manifest.json';
-    const blockedManifestExtension = '.block';
-
-    try {
-        const pluginFolders = await fs.readdir(PLUGIN_DIR, { withFileTypes: true });
-        const pluginDataList = [];
-
-        for (const folder of pluginFolders) {
-            if (folder.isDirectory()) {
-                const pluginPath = path.join(PLUGIN_DIR, folder.name);
-                const manifestPath = path.join(pluginPath, manifestFileName);
-                const blockedManifestPath = manifestPath + blockedManifestExtension;
-                let manifest = null;
-                let isEnabled = false;
-                let configEnvContent = null;
-
-                try {
-                    // Check for enabled manifest first
-                    await fs.access(manifestPath);
-                    const manifestContent = await fs.readFile(manifestPath, 'utf-8');
-                    manifest = JSON.parse(manifestContent);
-                    isEnabled = true;
-                } catch (error) {
-                    if (error.code === 'ENOENT') {
-                        // If enabled not found, check for disabled (blocked) manifest
-                        try {
-                            await fs.access(blockedManifestPath);
-                            const manifestContent = await fs.readFile(blockedManifestPath, 'utf-8');
-                            manifest = JSON.parse(manifestContent);
-                            isEnabled = false; // It exists but is blocked
-                        } catch (blockedError) {
-                            if (blockedError.code !== 'ENOENT') {
-                                console.warn(`[AdminPanel] Error reading blocked manifest for ${folder.name}:`, blockedError);
-                            }
-                            // If neither manifest exists, skip this folder or handle as error
-                            continue;
-                        }
-                    } else if (error instanceof SyntaxError) {
-                         console.warn(`[AdminPanel] Invalid JSON in manifest for ${folder.name}: ${manifestPath}`);
-                         continue; // Skip invalid manifest
-                    } else {
-                        console.warn(`[AdminPanel] Error accessing manifest for ${folder.name}:`, error);
-                        continue; // Skip on other errors
-                    }
-                }
-                
-                // Try reading plugin-specific config.env
-                try {
-                    const pluginConfigPath = path.join(pluginPath, 'config.env');
-                    await fs.access(pluginConfigPath);
-                    configEnvContent = await fs.readFile(pluginConfigPath, 'utf-8');
-                } catch (envError) {
-                     if (envError.code !== 'ENOENT') {
-                         console.warn(`[AdminPanel] Error reading config.env for ${folder.name}:`, envError);
-                     }
-                     // If config.env doesn't exist, configEnvContent remains null
-                }
-
-
-                if (manifest && manifest.name) { // Ensure manifest was loaded and has a name
-                    pluginDataList.push({
-                        name: manifest.name,
-                        manifest: manifest,
-                        enabled: isEnabled,
-                        configEnvContent: configEnvContent
-                    });
-                }
-            }
-        }
-        res.json(pluginDataList);
-    } catch (error) {
-        console.error('[AdminPanel] Error listing plugins:', error);
-        res.status(500).json({ error: 'Failed to list plugins', details: error.message });
-    }
-});
-
-// POST to toggle plugin enabled/disabled status
-adminApiRouter.post('/plugins/:pluginName/toggle', async (req, res) => {
-    const pluginName = req.params.pluginName;
-    const { enable } = req.body; // Expecting { enable: true } or { enable: false }
-    const PLUGIN_DIR = path.join(__dirname, 'Plugin');
-    const manifestFileName = 'plugin-manifest.json';
-    const blockedManifestExtension = '.block';
-
-    if (typeof enable !== 'boolean') {
-        return res.status(400).json({ error: 'Invalid request body. Expected { enable: boolean }.' });
-    }
-
-    try {
-        // Find the plugin folder by iterating and checking manifest 'name' field
-        const pluginFolders = await fs.readdir(PLUGIN_DIR, { withFileTypes: true });
-        let targetPluginPath = null;
-        let currentManifestPath = null;
-        let currentBlockedPath = null;
-        let foundManifest = null;
-
-        for (const folder of pluginFolders) {
-             if (folder.isDirectory()) {
-                const potentialPluginPath = path.join(PLUGIN_DIR, folder.name);
-                const potentialManifestPath = path.join(potentialPluginPath, manifestFileName);
-                const potentialBlockedPath = potentialManifestPath + blockedManifestExtension;
-                let manifestContent = null;
-                let isCurrentlyEnabled = false;
-
-                try {
-                    manifestContent = await fs.readFile(potentialManifestPath, 'utf-8');
-                    isCurrentlyEnabled = true;
-                } catch (err) {
-                    if (err.code === 'ENOENT') {
-                        try {
-                            manifestContent = await fs.readFile(potentialBlockedPath, 'utf-8');
-                            isCurrentlyEnabled = false;
-                        } catch (blockedErr) { continue; /* Not this folder */ }
-                    } else { continue; /* Error reading manifest */ }
-                }
-
-                try {
-                    const manifest = JSON.parse(manifestContent);
-                    if (manifest.name === pluginName) {
-                        targetPluginPath = potentialPluginPath;
-                        currentManifestPath = potentialManifestPath;
-                        currentBlockedPath = potentialBlockedPath;
-                        foundManifest = manifest; // Store the found manifest
-                        break; // Found the plugin
-                    }
-                } catch (parseErr) { continue; /* Invalid JSON */ }
-            }
-        }
-
-        if (!targetPluginPath || !foundManifest) {
-            return res.status(404).json({ error: `Plugin '${pluginName}' not found.` });
-        }
-
-        const manifestPath = currentManifestPath; //path.join(targetPluginPath, manifestFileName);
-        const blockedManifestPath = currentBlockedPath; //manifestPath + blockedManifestExtension;
-
-        if (enable) {
-            // Enable: Rename .block to .json (if it exists)
-            try {
-                await fs.rename(blockedManifestPath, manifestPath);
-                res.json({ message: `插件 ${pluginName} 已启用。请注意，更改可能需要重启服务才能完全生效。` });
-            } catch (error) {
-                if (error.code === 'ENOENT') {
-                    // If .block doesn't exist, it might already be enabled
-                     try {
-                         await fs.access(manifestPath); // Check if .json exists
-                         res.json({ message: `插件 ${pluginName} 已经是启用状态。` });
-                     } catch (accessError) {
-                         res.status(500).json({ error: `无法启用插件 ${pluginName}。找不到 manifest 文件。`, details: accessError.message });
-                     }
-                } else {
-                    console.error(`[AdminPanel] Error enabling plugin ${pluginName}:`, error);
-                    res.status(500).json({ error: `启用插件 ${pluginName} 时出错`, details: error.message });
-                }
-            }
-        } else {
-            // Disable: Rename .json to .block (if it exists)
-            try {
-                await fs.rename(manifestPath, blockedManifestPath);
-                res.json({ message: `插件 ${pluginName} 已禁用。请注意，更改可能需要重启服务才能完全生效。` });
-            } catch (error) {
-                if (error.code === 'ENOENT') {
-                    // If .json doesn't exist, it might already be disabled
-                    try {
-                         await fs.access(blockedManifestPath); // Check if .block exists
-                         res.json({ message: `插件 ${pluginName} 已经是禁用状态。` });
-                     } catch (accessError) {
-                         res.status(500).json({ error: `无法禁用插件 ${pluginName}。找不到 manifest 文件。`, details: accessError.message });
-                     }
-                } else {
-                    console.error(`[AdminPanel] Error disabling plugin ${pluginName}:`, error);
-                    res.status(500).json({ error: `禁用插件 ${pluginName} 时出错`, details: error.message });
-                }
-            }
-        }
-    } catch (error) {
-        console.error(`[AdminPanel] Error toggling plugin ${pluginName}:`, error);
-        res.status(500).json({ error: `处理插件 ${pluginName} 状态切换时出错`, details: error.message });
-    }
-});
-
-// POST to update plugin description in manifest
-adminApiRouter.post('/plugins/:pluginName/description', async (req, res) => {
-    const pluginName = req.params.pluginName;
-    const { description } = req.body;
-    const PLUGIN_DIR = path.join(__dirname, 'Plugin');
-    const manifestFileName = 'plugin-manifest.json';
-    const blockedManifestExtension = '.block';
-
-    if (typeof description !== 'string') {
-        return res.status(400).json({ error: 'Invalid request body. Expected { description: string }.' });
-    }
-
-    try {
-        // Find the plugin folder and the active manifest file (.json or .json.block)
-        const pluginFolders = await fs.readdir(PLUGIN_DIR, { withFileTypes: true });
-        let targetManifestPath = null;
-        let manifest = null;
-
-        for (const folder of pluginFolders) {
-            if (folder.isDirectory()) {
-                const potentialPluginPath = path.join(PLUGIN_DIR, folder.name);
-                const potentialManifestPath = path.join(potentialPluginPath, manifestFileName);
-                const potentialBlockedPath = potentialManifestPath + blockedManifestExtension;
-                let currentPath = null;
-                let manifestContent = null;
-
-                try { // Try reading enabled first
-                    manifestContent = await fs.readFile(potentialManifestPath, 'utf-8');
-                    currentPath = potentialManifestPath;
-                } catch (err) {
-                    if (err.code === 'ENOENT') {
-                        try { // Try reading disabled
-                            manifestContent = await fs.readFile(potentialBlockedPath, 'utf-8');
-                            currentPath = potentialBlockedPath;
-                        } catch (blockedErr) { continue; }
-                    } else { continue; }
-                }
-
-                try {
-                    const parsedManifest = JSON.parse(manifestContent);
-                    if (parsedManifest.name === pluginName) {
-                        targetManifestPath = currentPath;
-                        manifest = parsedManifest;
-                        break;
-                    }
-                } catch (parseErr) { continue; }
-            }
-        }
-
-
-        if (!targetManifestPath || !manifest) {
-            return res.status(404).json({ error: `Plugin '${pluginName}' or its manifest file not found.` });
-        }
-
-        // Update the description in the manifest object
-        manifest.description = description;
-
-        // Write the updated manifest back to the file
-        await fs.writeFile(targetManifestPath, JSON.stringify(manifest, null, 2), 'utf-8'); // Pretty print JSON
-
-        res.json({ message: `插件 ${pluginName} 的描述已更新。` });
-
-    } catch (error) {
-        console.error(`[AdminPanel] Error updating description for plugin ${pluginName}:`, error);
-        res.status(500).json({ error: `更新插件 ${pluginName} 描述时出错`, details: error.message });
-    }
-});
-
-// POST to save plugin-specific config.env
-adminApiRouter.post('/plugins/:pluginName/config', async (req, res) => {
-    const pluginName = req.params.pluginName;
-    const { content } = req.body;
-    const PLUGIN_DIR = path.join(__dirname, 'Plugin');
-
-     if (typeof content !== 'string') {
-        return res.status(400).json({ error: 'Invalid content format. String expected.' });
-    }
-
-    try {
-        // Find the plugin folder by name (similar logic to toggle/description)
-        const pluginFolders = await fs.readdir(PLUGIN_DIR, { withFileTypes: true });
-        let targetPluginPath = null;
-
-        for (const folder of pluginFolders) {
-             if (folder.isDirectory()) {
-                const potentialPluginPath = path.join(PLUGIN_DIR, folder.name);
-                // We need to read the manifest to confirm the plugin name matches
-                const manifestPath = path.join(potentialPluginPath, manifestFileName);
-                const blockedManifestPath = manifestPath + blockedManifestExtension;
-                let manifestContent = null;
-                 try {
-                    manifestContent = await fs.readFile(manifestPath, 'utf-8');
-                 } catch (err) {
-                     if (err.code === 'ENOENT') {
-                         try { manifestContent = await fs.readFile(blockedManifestPath, 'utf-8'); }
-                         catch (blockedErr) { continue; }
-                     } else { continue; }
-                 }
-                 try {
-                     const manifest = JSON.parse(manifestContent);
-                     if (manifest.name === pluginName) {
-                         targetPluginPath = potentialPluginPath;
-                         break;
-                     }
-                 } catch (parseErr) { continue; }
-             }
-        }
-
-        if (!targetPluginPath) {
-             return res.status(404).json({ error: `Plugin folder for '${pluginName}' not found.` });
-        }
-
-        const configPath = path.join(targetPluginPath, 'config.env');
-        await fs.writeFile(configPath, content, 'utf-8');
-        
-        // Optionally, try to update the plugin's config in pluginManager if loaded?
-        // This might be complex depending on how pluginManager handles config updates.
-        // For now, just saving the file. Restart might be needed for plugin to see changes.
-        
-        res.json({ message: `插件 ${pluginName} 的配置已保存。更改可能需要重启插件或服务才能生效。` });
-    } catch (error) {
-        console.error(`[AdminPanel] Error writing config.env for plugin ${pluginName}:`, error);
-        res.status(500).json({ error: `保存插件 ${pluginName} 配置时出错`, details: error.message });
-    }
-});
-
-// POST to update a specific invocation command's description in a plugin's manifest
-adminApiRouter.post('/plugins/:pluginName/commands/:commandIdentifier/description', async (req, res) => {
-    const { pluginName, commandIdentifier } = req.params;
-    const { description } = req.body;
-    const PLUGIN_DIR = path.join(__dirname, 'Plugin');
-    const manifestFileName = 'plugin-manifest.json';
-    const blockedManifestExtension = '.block';
-
-    if (typeof description !== 'string') {
-        return res.status(400).json({ error: 'Invalid request body. Expected { description: string }.' });
-    }
-
-    try {
-        // Find the plugin folder and its active manifest file
-        const pluginFolders = await fs.readdir(PLUGIN_DIR, { withFileTypes: true });
-        let targetManifestPath = null;
-        let manifest = null;
-        let pluginFound = false;
-
-        for (const folder of pluginFolders) {
-            if (folder.isDirectory()) {
-                const potentialPluginPath = path.join(PLUGIN_DIR, folder.name);
-                const potentialManifestPath = path.join(potentialPluginPath, manifestFileName);
-                const potentialBlockedPath = potentialManifestPath + blockedManifestExtension;
-                let currentPath = null;
-                let manifestContent = null;
-
-                try {
-                    manifestContent = await fs.readFile(potentialManifestPath, 'utf-8');
-                    currentPath = potentialManifestPath;
-                } catch (err) {
-                    if (err.code === 'ENOENT') {
-                        try {
-                            manifestContent = await fs.readFile(potentialBlockedPath, 'utf-8');
-                            currentPath = potentialBlockedPath;
-                        } catch (blockedErr) { continue; }
-                    } else { continue; }
-                }
-
-                try {
-                    const parsedManifest = JSON.parse(manifestContent);
-                    if (parsedManifest.name === pluginName) {
-                        targetManifestPath = currentPath;
-                        manifest = parsedManifest;
-                        pluginFound = true;
-                        break;
-                    }
-                } catch (parseErr) {
-                    console.warn(`[AdminPanel] Error parsing manifest for ${folder.name} while updating command description: ${parseErr.message}`);
-                    continue;
-                }
-            }
-        }
-
-        if (!pluginFound || !manifest) {
-            return res.status(404).json({ error: `Plugin '${pluginName}' or its manifest file not found.` });
-        }
-
-        // Find and update the command description
-        let commandUpdated = false;
-        if (manifest.capabilities && manifest.capabilities.invocationCommands && Array.isArray(manifest.capabilities.invocationCommands)) {
-            const commandIndex = manifest.capabilities.invocationCommands.findIndex(cmd => cmd.commandIdentifier === commandIdentifier || cmd.command === commandIdentifier);
-            if (commandIndex !== -1) {
-                manifest.capabilities.invocationCommands[commandIndex].description = description;
-                commandUpdated = true;
-            }
-        }
-
-        if (!commandUpdated) {
-            return res.status(404).json({ error: `Command '${commandIdentifier}' not found in plugin '${pluginName}'.` });
-        }
-
-        // Write the updated manifest back to the file
-        await fs.writeFile(targetManifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
-        res.json({ message: `指令 '${commandIdentifier}' 在插件 '${pluginName}' 中的描述已更新。` });
-
-    } catch (error) {
-        console.error(`[AdminPanel] Error updating command description for plugin ${pluginName}, command ${commandIdentifier}:`, error);
-        res.status(500).json({ error: `更新指令描述时出错`, details: error.message });
-    }
-});
-
-// POST to restart the server
-adminApiRouter.post('/server/restart', async (req, res) => {
-    res.json({ message: '服务器重启命令已发送。服务器正在关闭，如果由进程管理器（如 PM2）管理，它应该会自动重启。' });
-    
-    // Give a short delay for the response to be sent before exiting
-    setTimeout(() => {
-        console.log('[AdminPanel] Received restart command. Shutting down...');
-        process.exit(1); // Exit with code 1 to indicate an intentional restart/shutdown
-    }, 1000); // 1 second delay
-});
- 
-
-// --- Daily Notes API ---
+// Define dailyNoteRootPath here as it's needed by the adminPanelRoutes module
+// and was previously defined within the moved block.
 const dailyNoteRootPath = path.join(__dirname, 'dailynote');
 
-// GET all folder names in dailynote directory
-adminApiRouter.get('/dailynotes/folders', async (req, res) => {
-    try {
-        await fs.access(dailyNoteRootPath); // Check if dailynote directory exists
-        const entries = await fs.readdir(dailyNoteRootPath, { withFileTypes: true });
-        const folders = entries
-            .filter(entry => entry.isDirectory())
-            .map(entry => entry.name);
-        res.json({ folders });
-    } catch (error) {
-        if (error.code === 'ENOENT') {
-            // If dailynote directory doesn't exist, return empty array or specific message
-            console.warn('[AdminAPI] /dailynotes/folders - dailynote directory not found.');
-            res.json({ folders: [] }); // Or res.status(404).json({ error: 'Dailynote directory not found.' });
-        } else {
-            console.error('[AdminAPI] Error listing daily note folders:', error);
-            res.status(500).json({ error: 'Failed to list daily note folders', details: error.message });
-        }
-    }
-});
+// Import and use the admin panel routes
+const adminPanelRoutes = require('./routes/adminPanelRoutes')(DEBUG_MODE, dailyNoteRootPath, pluginManager);
 
-// GET all note files in a specific folder with last modified time
-adminApiRouter.get('/dailynotes/folder/:folderName', async (req, res) => {
-    const folderName = req.params.folderName;
-    const specificFolderParentPath = path.join(dailyNoteRootPath, folderName); // Renamed to avoid conflict
-
-    try {
-        await fs.access(specificFolderParentPath); // Check if specific folder exists
-        const files = await fs.readdir(specificFolderParentPath);
-        const txtFiles = files.filter(file => file.toLowerCase().endsWith('.txt'));
-        const PREVIEW_LENGTH = 100; // Number of characters for preview
-
-        const notes = await Promise.all(txtFiles.map(async (file) => {
-            const filePath = path.join(specificFolderParentPath, file);
-            const stats = await fs.stat(filePath);
-            let preview = '';
-            try {
-                const content = await fs.readFile(filePath, 'utf-8');
-                preview = content.substring(0, PREVIEW_LENGTH).replace(/\n/g, ' ') + (content.length > PREVIEW_LENGTH ? '...' : '');
-            } catch (readError) {
-                console.warn(`[AdminAPI] Error reading file for preview ${filePath}: ${readError.message}`);
-                preview = '[无法加载预览]';
-            }
-            return {
-                name: file,
-                lastModified: stats.mtime.toISOString(),
-                preview: preview
-            };
-        }));
-
-        // Sort notes by name (which usually includes date and time)
-        notes.sort((a, b) => a.name.localeCompare(b.name));
-
-        res.json({ notes });
-
-    } catch (error) {
-        if (error.code === 'ENOENT') {
-            console.warn(`[AdminAPI] /dailynotes/folder/${folderName} - Folder not found.`);
-            res.status(404).json({ error: `Folder '${folderName}' not found.` });
-        } else {
-            console.error(`[AdminAPI] Error listing notes in folder ${folderName}:`, error);
-            res.status(500).json({ error: `Failed to list notes in folder ${folderName}`, details: error.message });
-        }
-    }
-});
-
-// New API endpoint for searching notes with full content
-adminApiRouter.get('/dailynotes/search', async (req, res) => {
-    const { term, folder } = req.query; // term for searchTerm, folder for folderName
-
-    if (!term || typeof term !== 'string' || term.trim() === '') {
-        return res.status(400).json({ error: 'Search term is required.' });
-    }
-
-    const searchTerm = term.trim().toLowerCase();
-    const PREVIEW_LENGTH = 100; // Consistent with existing preview logic
-    let foldersToSearch = [];
-    const matchedNotes = [];
-
-    try {
-        if (folder && typeof folder === 'string' && folder.trim() !== '') {
-            // Search in a specific folder
-            const specificFolderPath = path.join(dailyNoteRootPath, folder);
-            try {
-                await fs.access(specificFolderPath); // Check if folder exists
-                if ((await fs.stat(specificFolderPath)).isDirectory()) {
-                    foldersToSearch.push({ name: folder, path: specificFolderPath });
-                } else {
-                    console.warn(`[AdminAPI Search] Specified path '${folder}' is not a directory.`);
-                    return res.status(404).json({ error: `Specified path '${folder}' is not a directory.`});
-                }
-            } catch (e) {
-                console.warn(`[AdminAPI Search] Specified folder '${folder}' not found during access check.`);
-                return res.status(404).json({ error: `Specified folder '${folder}' not found.` });
-            }
-        } else {
-            // Search in all folders (Global Search if folder is not provided)
-            // This part can be enabled if global search is desired.
-            // For now, let's assume if folder is not provided, it's an error or not supported by current client UI.
-            // However, to make the API flexible:
-            await fs.access(dailyNoteRootPath);
-            const entries = await fs.readdir(dailyNoteRootPath, { withFileTypes: true });
-            entries.filter(entry => entry.isDirectory()).forEach(dir => {
-                foldersToSearch.push({ name: dir.name, path: path.join(dailyNoteRootPath, dir.name) });
-            });
-            if (foldersToSearch.length === 0) {
-                 console.log('[AdminAPI Search] No folders found in dailynote directory for global search.');
-                 return res.json({ notes: [] });
-            }
-        }
-
-        for (const dir of foldersToSearch) {
-            const files = await fs.readdir(dir.path);
-            const txtFiles = files.filter(file => file.toLowerCase().endsWith('.txt'));
-
-            for (const fileName of txtFiles) {
-                const filePath = path.join(dir.path, fileName);
-                try {
-                    const content = await fs.readFile(filePath, 'utf-8');
-                    if (content.toLowerCase().includes(searchTerm)) {
-                        const stats = await fs.stat(filePath);
-                        let preview = content.substring(0, PREVIEW_LENGTH).replace(/\n/g, ' ') + (content.length > PREVIEW_LENGTH ? '...' : '');
-                        matchedNotes.push({
-                            name: fileName,
-                            folderName: dir.name, // Include folderName in the response
-                            lastModified: stats.mtime.toISOString(),
-                            preview: preview
-                            // Optionally, include full content if needed by client, but for search result list, preview is usually enough.
-                            // content: content // If client needs full content for display after search
-                        });
-                    }
-                } catch (readError) {
-                    console.warn(`[AdminAPI Search] Error reading file ${filePath} for search: ${readError.message}`);
-                }
-            }
-        }
-
-        // Sort notes by folderName, then by note name
-        matchedNotes.sort((a, b) => {
-            const folderCompare = a.folderName.localeCompare(b.folderName);
-            if (folderCompare !== 0) return folderCompare;
-            return a.name.localeCompare(b.name);
-        });
-
-        res.json({ notes: matchedNotes });
-
-    } catch (error) {
-        if (error.code === 'ENOENT' && dailyNoteRootPath === error.path) {
-            console.warn('[AdminAPI Search] dailynote directory not found.');
-            return res.json({ notes: [] }); // Return empty if root daily note dir doesn't exist
-        }
-        console.error('[AdminAPI Search] Error during daily note search:', error);
-        res.status(500).json({ error: 'Failed to search daily notes', details: error.message });
-    }
-});
-
-// GET content of a specific note file
-adminApiRouter.get('/dailynotes/note/:folderName/:fileName', async (req, res) => {
-    const { folderName, fileName } = req.params;
-    const filePath = path.join(dailyNoteRootPath, folderName, fileName);
-
-    try {
-        await fs.access(filePath); // Check if file exists
-        const content = await fs.readFile(filePath, 'utf-8');
-        res.json({ content });
-    } catch (error) {
-        if (error.code === 'ENOENT') {
-            console.warn(`[AdminAPI] /dailynotes/note/${folderName}/${fileName} - File not found.`);
-            res.status(404).json({ error: `Note file '${fileName}' in folder '${folderName}' not found.` });
-        } else {
-            console.error(`[AdminAPI] Error reading note file ${folderName}/${fileName}:`, error);
-            res.status(500).json({ error: `Failed to read note file ${folderName}/${fileName}`, details: error.message });
-        }
-    }
-});
-
-// POST to save/update content of a specific note file
-adminApiRouter.post('/dailynotes/note/:folderName/:fileName', async (req, res) => {
-    const { folderName, fileName } = req.params;
-    const { content } = req.body;
-
-    if (typeof content !== 'string') {
-        return res.status(400).json({ error: 'Invalid request body. Expected { content: string }.' });
-    }
-
-    const targetFolderPath = path.join(dailyNoteRootPath, folderName); // Renamed to avoid conflict
-    const filePath = path.join(targetFolderPath, fileName);
-
-    try {
-        // Ensure the target directory exists
-        await fs.mkdir(targetFolderPath, { recursive: true });
-        
-        await fs.writeFile(filePath, content, 'utf-8');
-        res.json({ message: `Note '${fileName}' in folder '${folderName}' saved successfully.` });
-    } catch (error) {
-        console.error(`[AdminAPI] Error saving note file ${folderName}/${fileName}:`, error);
-        res.status(500).json({ error: `Failed to save note file ${folderName}/${fileName}`, details: error.message });
-    }
-});
-
-// POST to move one or more notes to a different folder
-adminApiRouter.post('/dailynotes/move', async (req, res) => {
-    const { sourceNotes, targetFolder } = req.body;
-
-    if (!Array.isArray(sourceNotes) || sourceNotes.some(n => !n.folder || !n.file) || typeof targetFolder !== 'string') {
-        return res.status(400).json({ error: 'Invalid request body. Expected { sourceNotes: [{folder, file}], targetFolder: string }.' });
-    }
-
-    const results = {
-        moved: [],
-        errors: []
-    };
-
-    const targetFolderPath = path.join(dailyNoteRootPath, targetFolder);
-
-    try {
-        // Ensure the overall target directory exists
-        await fs.mkdir(targetFolderPath, { recursive: true });
-    } catch (mkdirError) {
-        console.error(`[AdminAPI] Error creating target folder ${targetFolder} for move:`, mkdirError);
-        return res.status(500).json({ error: `Failed to create target folder '${targetFolder}'`, details: mkdirError.message });
-    }
-
-    for (const note of sourceNotes) {
-        const sourceFilePath = path.join(dailyNoteRootPath, note.folder, note.file);
-        const destinationFilePath = path.join(targetFolderPath, note.file); // Keep original filename in new folder
-
-        try {
-            // Check if source file exists
-            await fs.access(sourceFilePath);
-
-            // Check if destination file already exists (optional: add overwrite logic if needed)
-            try {
-                await fs.access(destinationFilePath);
-                // File already exists at destination
-                results.errors.push({
-                    note: `${note.folder}/${note.file}`,
-                    error: `File already exists at destination '${targetFolder}/${note.file}'. Move aborted for this file.`
-                });
-                continue; // Skip to next file
-            } catch (destAccessError) {
-                // Destination file does not exist, proceed with move
-            }
-            
-            await fs.rename(sourceFilePath, destinationFilePath);
-            results.moved.push(`${note.folder}/${note.file} to ${targetFolder}/${note.file}`);
-        } catch (error) {
-            if (error.code === 'ENOENT' && error.path === sourceFilePath) {
-                 results.errors.push({ note: `${note.folder}/${note.file}`, error: 'Source file not found.' });
-            } else {
-                console.error(`[AdminAPI] Error moving note ${note.folder}/${note.file} to ${targetFolder}:`, error);
-                results.errors.push({ note: `${note.folder}/${note.file}`, error: error.message });
-            }
-        }
-    }
-
-    const message = `Moved ${results.moved.length} note(s). ${results.errors.length > 0 ? `Encountered ${results.errors.length} error(s).` : ''}`;
-    res.json({ message, moved: results.moved, errors: results.errors });
-});
-
-// Placeholder for delete route
-// adminApiRouter.delete('/dailynotes/note/:folderName/:fileName', async (req, res) => { /* ... */ });
-// --- End Daily Notes API ---
-
-app.use('/admin_api', adminApiRouter);
+app.use('/admin_api', adminPanelRoutes);
 // --- End Admin API Router ---
 
 

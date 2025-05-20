@@ -20,6 +20,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const noteEditorStatusSpan = document.getElementById('note-editor-status');
     const moveSelectedNotesButton = document.getElementById('move-selected-notes');
     const moveTargetFolderSelect = document.getElementById('move-target-folder');
+    const deleteSelectedNotesButton = document.getElementById('delete-selected-notes-button'); // 新增：批量删除按钮
     const notesActionStatusSpan = document.getElementById('notes-action-status');
     const searchDailyNotesInput = document.getElementById('search-daily-notes'); // 新增：搜索框
 
@@ -871,6 +872,7 @@ Description Length: ${newDescription.length}`);
         noteEditorAreaDiv.style.display = 'none'; // Hide editor
         notesActionStatusSpan.textContent = '';
         moveSelectedNotesButton.disabled = true;
+        if (deleteSelectedNotesButton) deleteSelectedNotesButton.disabled = true; // 新增：禁用删除按钮
         if (searchDailyNotesInput) searchDailyNotesInput.value = ''; // 清空搜索框
         await loadNotesFolders();
         // Optionally, load notes from the first folder automatically or show a placeholder
@@ -937,6 +939,7 @@ Description Length: ${newDescription.length}`);
             const data = await apiFetch(`${API_BASE_URL}/dailynotes/folder/${folderName}`);
             notesListViewDiv.innerHTML = ''; // Clear loading state
             if (data.notes && data.notes.length > 0) {
+                data.notes.reverse(); // Add this line to reverse the order
                 data.notes.forEach(note => {
                     // renderNoteCard now expects note.folderName to be part of the note object for consistency
                     // or pass folderName explicitly if the endpoint doesn't return it per note
@@ -978,6 +981,7 @@ Description Length: ${newDescription.length}`);
             notesListViewDiv.innerHTML = ''; // Clear loading/previous results
 
             if (data.notes && data.notes.length > 0) {
+                data.notes.reverse(); // Add this line to reverse the order
                 data.notes.forEach(note => {
                     // The search API now returns folderName with each note
                     const card = renderNoteCard(note, note.folderName);
@@ -1048,8 +1052,10 @@ Description Length: ${newDescription.length}`);
     }
     
     function updateMoveButtonStatus() {
-        moveSelectedNotesButton.disabled = selectedNotes.size === 0;
-        moveTargetFolderSelect.disabled = selectedNotes.size === 0;
+        const hasSelection = selectedNotes.size > 0;
+        moveSelectedNotesButton.disabled = !hasSelection;
+        moveTargetFolderSelect.disabled = !hasSelection;
+        if (deleteSelectedNotesButton) deleteSelectedNotesButton.disabled = !hasSelection; // 新增：更新删除按钮状态
     }
 
     async function openNoteForEditing(folderName, fileName) {
@@ -1063,6 +1069,7 @@ Description Length: ${newDescription.length}`);
             document.getElementById('notes-list-view').style.display = 'none';
             document.querySelector('.notes-sidebar').style.display = 'none'; // Hide sidebar too
             document.querySelector('.notes-toolbar').style.display = 'none';
+            document.querySelector('.notes-content-area').style.display = 'none'; // Hide content area
             noteEditorAreaDiv.style.display = 'block';
             noteEditorStatusSpan.textContent = `正在编辑: ${folderName}/${fileName}`;
         } catch (error) {
@@ -1106,6 +1113,7 @@ Description Length: ${newDescription.length}`);
         document.getElementById('notes-list-view').style.display = 'grid'; // or 'block' if not grid
         document.querySelector('.notes-sidebar').style.display = 'block'; // Show sidebar again
         document.querySelector('.notes-toolbar').style.display = 'flex'; // Show toolbar again
+        document.querySelector('.notes-content-area').style.display = 'flex'; // Show content area again, restore its flex display
 
         // If a folder was active, re-highlight it (or simply reload folders which reloads notes)
         // For simplicity, if currentNotesFolder is set, reload its notes.
@@ -1183,9 +1191,71 @@ Description Length: ${newDescription.length}`);
     if (saveNoteButton) saveNoteButton.addEventListener('click', saveNoteChanges);
     if (cancelEditNoteButton) cancelEditNoteButton.addEventListener('click', closeNoteEditor);
     if (moveSelectedNotesButton) moveSelectedNotesButton.addEventListener('click', moveSelectedNotesHandler);
+    if (deleteSelectedNotesButton) deleteSelectedNotesButton.addEventListener('click', deleteSelectedNotesHandler); // 新增：删除按钮事件
     if (searchDailyNotesInput) searchDailyNotesInput.addEventListener('input', filterNotesBySearch);
 
 
     // --- End Daily Notes Manager Functions ---
 
+    // --- New Function for Deleting Selected Notes ---
+    async function deleteSelectedNotesHandler() {
+        if (selectedNotes.size === 0) {
+            showMessage('没有选中的日记。', 'error');
+            return;
+        }
+
+        if (!confirm(`您确定要删除选中的 ${selectedNotes.size} 个日记吗？此操作无法撤销。`)) {
+            return;
+        }
+
+        const notesToDelete = Array.from(selectedNotes).map(noteId => {
+            const [folder, file] = noteId.split('/');
+            return { folder, file };
+        });
+
+        notesActionStatusSpan.textContent = '正在删除...';
+        try {
+            const response = await apiFetch(`${API_BASE_URL}/dailynotes/delete-batch`, {
+                method: 'POST', // Changed to POST as per server.js implementation
+                body: JSON.stringify({ notesToDelete })
+            });
+            showMessage(response.message || `${notesToDelete.length} 个日记已删除。`, response.errors && response.errors.length > 0 ? 'warning' : 'success');
+            
+            if (response.errors && response.errors.length > 0) {
+                console.error('删除日记时发生错误:', response.errors);
+                notesActionStatusSpan.textContent = `部分删除失败: ${response.errors.map(e => e.error).join(', ')}`;
+            } else {
+                notesActionStatusSpan.textContent = '';
+            }
+
+            const folderToReload = currentNotesFolder;
+            selectedNotes.clear();
+            updateMoveButtonStatus(); // This will disable buttons again
+
+            // Refresh folder list (in case a folder becomes empty and might be handled differently by UI, though unlikely for delete)
+            // and notes list for the current folder.
+            await loadNotesFolders(); // Reloads all folders and their counts, re-populates move target
+
+            // Try to reselect the previously active folder
+            if (folderToReload) {
+                const currentFolderLi = notesFolderListUl.querySelector(`li[data-folder-name="${folderToReload}"]`);
+                if (currentFolderLi) {
+                    currentFolderLi.click(); // This will trigger loadNotesForFolder
+                } else if (notesFolderListUl.firstChild) { // If original folder gone (e.g., it was deleted), click first
+                    notesFolderListUl.firstChild.click();
+                } else { // No folders left
+                    notesListViewDiv.innerHTML = '<p>请选择一个文件夹。</p>';
+                }
+            } else if (notesFolderListUl.firstChild) { // If no folder was current, click first
+                 notesFolderListUl.firstChild.click();
+            } else {
+                notesListViewDiv.innerHTML = '<p>没有日记可以显示。</p>';
+            }
+
+        } catch (error) {
+            notesActionStatusSpan.textContent = `删除失败: ${error.message}`;
+            // showMessage is handled by apiFetch
+        }
+    }
+    // --- End New Function ---
 });
